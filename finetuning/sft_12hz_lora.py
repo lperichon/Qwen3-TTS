@@ -16,7 +16,6 @@
 import argparse
 import json
 import os
-import shutil
 
 import torch
 from accelerate import Accelerator
@@ -27,30 +26,47 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoConfig
 
+try:
+    from peft import LoraConfig, TaskType, get_peft_model, PeftModel
+except ImportError as exc:
+    raise SystemExit(
+        "peft is required for LoRA fine-tuning. Install it with: pip install peft"
+    ) from exc
+
 target_speaker_embedding = None
+
+
+def _parse_list(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def compute_loss(model, batch):
     global target_speaker_embedding
 
-    input_ids = batch['input_ids']
-    codec_ids = batch['codec_ids']
-    ref_mels = batch['ref_mels']
-    text_embedding_mask = batch['text_embedding_mask']
-    codec_embedding_mask = batch['codec_embedding_mask']
-    attention_mask = batch['attention_mask']
-    codec_0_labels = batch['codec_0_labels']
-    codec_mask = batch['codec_mask']
+    input_ids = batch["input_ids"]
+    codec_ids = batch["codec_ids"]
+    ref_mels = batch["ref_mels"]
+    text_embedding_mask = batch["text_embedding_mask"]
+    codec_embedding_mask = batch["codec_embedding_mask"]
+    attention_mask = batch["attention_mask"]
+    codec_0_labels = batch["codec_0_labels"]
+    codec_mask = batch["codec_mask"]
 
     with torch.no_grad():
-        speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
+        speaker_embedding = model.speaker_encoder(
+            ref_mels.to(dtype=next(model.parameters()).dtype, device=next(model.parameters()).device)
+        ).detach()
+
     if model.training and target_speaker_embedding is None:
-        target_speaker_embedding = speaker_embedding
+        target_speaker_embedding = speaker_embedding.detach().to("cpu")
 
     input_text_ids = input_ids[:, :, 0]
     input_codec_ids = input_ids[:, :, 1]
 
-    input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
+    input_text_embedding = model.talker.model.text_embedding(input_text_ids)
+    if hasattr(model.talker, 'text_projection'):
+        input_text_embedding = model.talker.text_projection(input_text_embedding)
+    input_text_embedding = input_text_embedding * text_embedding_mask
     input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
     input_codec_embedding[:, 6, :] = speaker_embedding
 
@@ -64,17 +80,26 @@ def compute_loss(model, batch):
     outputs = model.talker(
         inputs_embeds=input_embeddings[:, :-1, :],
         attention_mask=attention_mask[:, :-1],
-        labels=codec_0_labels[:, 1:],
-        output_hidden_states=True
+        labels=None,
+        output_hidden_states=True,
+    )
+    logits = outputs.logits
+    codec_0_targets = codec_0_labels[:, 1:]
+    codec_0_loss = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        codec_0_targets.reshape(-1),
+        ignore_index=-100,
     )
 
     hidden_states = outputs.hidden_states[0][-1]
     talker_hidden_states = hidden_states[codec_mask[:, 1:]]
     talker_codec_ids = codec_ids[codec_mask]
 
-    _, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
+    _, sub_talker_loss = model.talker.forward_sub_talker_finetune(
+        talker_codec_ids, talker_hidden_states
+    )
 
-    return outputs.loss + 0.3 * sub_talker_loss
+    return codec_0_loss + sub_talker_loss
 
 
 def evaluate(model, dataloader, accelerator):
@@ -98,30 +123,67 @@ def train():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--init_model_path", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
-    parser.add_argument("--output_model_path", type=str, default="output")
+    parser.add_argument("--output_model_path", type=str, default="output_lora")
     parser.add_argument("--train_jsonl", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--lr", type=float, default=2e-6)
     parser.add_argument("--num_epochs", type=int, default=3)
+    parser.add_argument("--start_epoch", type=int, default=0)
+    parser.add_argument("--resume_adapter", type=str, default=None)
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
+    parser.add_argument("--attn_implementation", type=str, default="flash_attention_2")
+    parser.add_argument("--save_every", type=int, default=1)
+    parser.add_argument("--lora_rank", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--lora_bias", type=str, default="none", choices=["none", "all", "lora_only"])
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+    )
     parser.add_argument("--val_jsonl", type=str, default=None)
     parser.add_argument("--eval_batch_size", type=int, default=None)
     parser.add_argument("--eval_every", type=int, default=1)
     args = parser.parse_args()
 
-    accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=None if args.mixed_precision == "no" else args.mixed_precision,
+        log_with="tensorboard",
+    )
 
     MODEL_PATH = args.init_model_path
 
     qwen3tts = Qwen3TTSModel.from_pretrained(
         MODEL_PATH,
         torch_dtype=torch.bfloat16,
-        #attn_implementation="flash_attention_2",
+        attn_implementation=args.attn_implementation,
     )
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
-    train_data = open(args.train_jsonl).readlines()
-    train_data = [json.loads(line) for line in train_data]
+    if args.resume_adapter:
+        model = PeftModel.from_pretrained(
+            qwen3tts.model,
+            args.resume_adapter,
+            is_trainable=True,
+        )
+    else:
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            bias=args.lora_bias,
+            target_modules=_parse_list(args.lora_target_modules),
+            task_type=TaskType.CAUSAL_LM,
+        )
+        model = get_peft_model(qwen3tts.model, lora_config)
+    if accelerator.is_main_process:
+        model.print_trainable_parameters()
+
+    train_data = [json.loads(line) for line in open(args.train_jsonl).readlines()]
     dataset = TTSDataset(train_data, qwen3tts.processor, config)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
     val_dataloader = None
@@ -131,21 +193,22 @@ def train():
         eval_bs = args.eval_batch_size or args.batch_size
         val_dataloader = DataLoader(val_dataset, batch_size=eval_bs, shuffle=False, collate_fn=val_dataset.collate_fn)
 
-    optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
 
     if val_dataloader is not None:
         model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
-            qwen3tts.model, optimizer, train_dataloader, val_dataloader
+            model, optimizer, train_dataloader, val_dataloader
         )
     else:
         model, optimizer, train_dataloader = accelerator.prepare(
-            qwen3tts.model, optimizer, train_dataloader
+            model, optimizer, train_dataloader
         )
 
     num_epochs = args.num_epochs
     model.train()
 
-    for epoch in range(num_epochs):
+    for local_epoch in range(num_epochs):
+        epoch = args.start_epoch + local_epoch
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
                 loss = compute_loss(model, batch)
@@ -161,45 +224,40 @@ def train():
             if step % 10 == 0:
                 accelerator.print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}")
 
-        if val_dataloader is not None and (epoch + 1) % args.eval_every == 0:
+        if val_dataloader is not None and (local_epoch + 1) % args.eval_every == 0:
             val_loss = evaluate(model, val_dataloader, accelerator)
             if accelerator.is_main_process and val_loss is not None:
                 accelerator.print(f"Epoch {epoch} | Val Loss: {val_loss:.4f}")
             model.train()
 
-        if accelerator.is_main_process:
+        if accelerator.is_main_process and (local_epoch + 1) % args.save_every == 0:
             output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
-            shutil.copytree(MODEL_PATH, output_dir, dirs_exist_ok=True)
+            os.makedirs(output_dir, exist_ok=True)
+
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.save_pretrained(output_dir, safe_serialization=True)
 
             input_config_file = os.path.join(MODEL_PATH, "config.json")
             output_config_file = os.path.join(output_dir, "config.json")
-            with open(input_config_file, 'r', encoding='utf-8') as f:
+            with open(input_config_file, "r", encoding="utf-8") as f:
                 config_dict = json.load(f)
             config_dict["tts_model_type"] = "custom_voice"
             talker_config = config_dict.get("talker_config", {})
-            talker_config["spk_id"] = {
-                args.speaker_name: 3000
-            }
-            talker_config["spk_is_dialect"] = {
-                args.speaker_name: False
-            }
+            talker_config.setdefault("spk_id", {})
+            talker_config.setdefault("spk_is_dialect", {})
+            talker_config["spk_id"][args.speaker_name] = 3000
+            talker_config["spk_is_dialect"][args.speaker_name] = False
             config_dict["talker_config"] = talker_config
 
-            with open(output_config_file, 'w', encoding='utf-8') as f:
+            with open(output_config_file, "w", encoding="utf-8") as f:
                 json.dump(config_dict, f, indent=2, ensure_ascii=False)
 
-            unwrapped_model = accelerator.unwrap_model(model)
-            state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
+            if target_speaker_embedding is not None:
+                save_file(
+                    {"target_speaker_embedding": target_speaker_embedding[0]},
+                    os.path.join(output_dir, "speaker_embedding.safetensors"),
+                )
 
-            drop_prefix = "speaker_encoder"
-            keys_to_drop = [k for k in state_dict.keys() if k.startswith(drop_prefix)]
-            for k in keys_to_drop:
-                del state_dict[k]
-
-            weight = state_dict['talker.model.codec_embedding.weight']
-            state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
-            save_path = os.path.join(output_dir, "model.safetensors")
-            save_file(state_dict, save_path)
 
 if __name__ == "__main__":
     train()
