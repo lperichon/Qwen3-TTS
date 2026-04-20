@@ -50,10 +50,31 @@ python sft_12hz.py \
   --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
   --output_model_path output \
   --train_jsonl train_with_codes.jsonl \
-  --batch_size 32 \
-  --lr 2e-6 \
-  --num_epochs 10 \
+  --batch_size 1 \
+  --lr 2e-5 \
+  --num_epochs 3 \
   --speaker_name speaker_test
+```
+
+LoRA:
+
+```bash
+pip install peft
+python sft_12hz_lora.py \
+  --init_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --output_model_path output \
+  --train_jsonl train_with_codes.jsonl \
+  --batch_size 2  \
+  --lr 2e-6  \
+  --num_epochs 10  \
+  --speaker_name speaker_test \
+  --gradient_accumulation_steps 4\
+  --mixed_precision bf16 \
+  --attn_implementation sdpa \
+  --lora_rank 16 \
+  --lora_alpha 32 \
+  --lora_dropout 0.05 \
+  --lora_target_modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
 ```
 
 Checkpoints will be written to:
@@ -65,24 +86,20 @@ Checkpoints will be written to:
 
 ### 4) Quick inference test
 
-```python
-import torch
-import soundfile as sf
-from qwen_tts import Qwen3TTSModel
+```bash
+python infer_sft_custom_voice.py \
+  --model_path ./output/checkpoint-epoch-2/ \
+  --speaker_name speaker_test
+  --text "She said she would be here by noon."
+```
 
-device = "cuda:0"
-tts = Qwen3TTSModel.from_pretrained(
-    "output/checkpoint-epoch-2",
-    device_map=device,
-    dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2",
-)
-
-wavs, sr = tts.generate_custom_voice(
-    text="She said she would be here by noon.",
-    speaker="speaker_test",
-)
-sf.write("output.wav", wavs[0], sr)
+```bash
+python infer_lora_custom_voice.py \
+  --base_model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --adapter_path ./output/checkpoint-epoch-9/ \
+  --speaker_name speaker_test \
+  --attn_implementation sdpa \
+  --text "She said she would be here by noon."
 ```
 
 ### One-click shell script example

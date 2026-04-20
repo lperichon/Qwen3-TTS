@@ -155,7 +155,12 @@ def train():
         log_with="tensorboard",
     )
 
-    MODEL_PATH = args.init_model_path
+    from huggingface_hub import snapshot_download
+
+    if not os.path.exists(args.init_model_path):
+        MODEL_PATH = snapshot_download(repo_id=args.init_model_path)
+    else:
+        MODEL_PATH = args.init_model_path
 
     qwen3tts = Qwen3TTSModel.from_pretrained(
         MODEL_PATH,

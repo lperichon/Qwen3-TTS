@@ -105,7 +105,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_model_path", required=True)
     parser.add_argument("--adapter_path", required=True)
-    parser.add_argument("--speaker_name", default="female01")
+    parser.add_argument("--speaker_name", default="speaker_test")
     parser.add_argument("--speaker_id", type=int, default=3000)
     parser.add_argument("--speaker_embedding_path", default=None)
     parser.add_argument("--text", default="She said she would be here by noon.")
